@@ -9,6 +9,7 @@ import subprocess
 import time
 import re
 from xml.etree import ElementTree
+from functools import partial
 
 from nixops.backends import MachineDefinition, MachineState
 import nixops.util
@@ -31,6 +32,7 @@ class LibvirtdDefinition(MachineDefinition):
         self.extra_devices = x.find("attr[@name='extraDevicesXML']/string").get("value")
         self.extra_domain = x.find("attr[@name='extraDomainXML']/string").get("value")
         self.headless = x.find("attr[@name='headless']/bool").get("value") == 'true'
+        self.isIPStatic = x.find("attr[@name='isIPStatic']/bool").get("value") == 'true'
         self.image_dir = x.find("attr[@name='imageDir']/string").get("value")
         self.private_ipv4_setting = x.find("attr[@name='privateIPv4']/string").get("value")
         assert self.image_dir is not None
@@ -42,8 +44,10 @@ class LibvirtdDefinition(MachineDefinition):
 
 
 class LibvirtdState(MachineState):
+    primary_mac = nixops.util.attr_property("libvirtd.primaryMAC", None)
     private_ipv4 = nixops.util.attr_property("privateIpv4", None)
     private_ipv4_setting = nixops.util.attr_property("libvirtd.privateIpv4Setting", "dhcp") # Default for retro-compatibility
+    is_ip_static = nixops.util.attr_property("libvirtd.isIPStatic", False, bool) # Default for retro-compatibility
     client_public_key = nixops.util.attr_property("libvirtd.clientPublicKey", None)
     client_private_key = nixops.util.attr_property("libvirtd.clientPrivateKey", None)
     domain_xml = nixops.util.attr_property("libvirtd.domainXML", None)
@@ -74,6 +78,7 @@ class LibvirtdState(MachineState):
         assert isinstance(defn, LibvirtdDefinition)
         self.set_common_state(defn)
         self.private_ipv4_setting = defn.private_ipv4_setting
+        self.is_ip_static = defn.isIPStatic
         self.domain_xml = self._make_domain_xml(defn)
 
         if not self.client_public_key:
@@ -88,6 +93,14 @@ class LibvirtdState(MachineState):
                  "-A", "nodes.{0}.config.deployment.libvirtd.baseImage".format(self.name),
                  "-o", "{0}/libvirtd-image-{1}".format(self.depl.tempdir, self.name)],
                 capture_stdout=True, env=newEnv).rstrip()
+            # self._logged_exec(
+            #     ["virsh", "-c", "qemu:///system",
+            #      "net-update", net[0], "add",
+            #      "ip-dhcp-host",
+            #      "<host mac='{0}' name='{1}' ip='{2}' />".format(
+            #          net[1], self.name, self.private_ipv4_setting),
+            #      "--config"
+            #      ]),
 
             if not os.access(defn.image_dir, os.W_OK):
                 raise Exception('{} is not writable by this user or it does not exist'.format(defn.image_dir))
@@ -104,19 +117,62 @@ class LibvirtdState(MachineState):
     def _disk_path(self, defn):
         return "{0}/{1}.img".format(defn.image_dir, self._vm_id())
 
+    def _generate_primary_mac(self):
+         mac = [0x52, 0x54, 0x00,
+                random.randint(0x00, 0x7f),
+                random.randint(0x00, 0xff),
+                random.randint(0x00, 0xff)]
+         self.primary_mac = ':'.join(map(lambda x: "%02x" % x, mac))
+
+    def maybe_mac(n):
+        if n == self.primary_net:
+            return '<mac address="' + self.primary_mac + '" />'
+        else:
+            return ""
+
     def _make_domain_xml(self, defn):
         qemu_executable = "qemu-system-x86_64"
         qemu = spawn.find_executable(qemu_executable)
         assert qemu is not None, "{} executable not found. Please install QEMU first.".format(qemu_executable)
 
         def iface(n):
-            return "\n".join([
-                '    <interface type="network">',
-                '      <source network="{0}"/>',
-                '    </interface>',
-            ]).format(n)
+            if (self.is_ip_static):
+             self.log('address is static')
+             self.log(n)
+             self.log(self.primary_mac)
+             self.log(self.private_ipv4_setting)
+             return "\n".join([
+                 '    <interface type="network">',
+                 '      <source network="{0}"/>',
+                 '      <mac address="{1}"/>',
+                 '      <ip address="{2}" prefix="24"/>',
+                 '    </interface>'
+             ]).format(n, self.primary_mac, self.private_ipv4_setting)
+            #   self._logged_exec(
+            #       ["virsh", "-c", "qemu:///system",
+            #        "net-update", n, "add",
+            #        "ip-dhcp-host",
+            #        "<host mac='{0}' name='{1}' ip='{2}' />".format(
+            #            net[1], self.name, self.private_ipv4_setting),
+            #        "--config"
+            #        ])
+            #   return "\n".join([
+            #       '    <interface type="network">',
+            #       '      <source network="{0}"/>',
+            #       maybe_mac(n),
+            #       '    </interface>',
+            #    ]).format(n)
+            else:
+                self.log('address is not static')
+                return "\n".join([
+                    '    <interface type="network">',
+                    '      <source network="{0}"/>',
+                    '    </interface>',
+                ]).format(n)
 # '<mac address="' + self.primary_mac + '" />'
 
+        if (self.is_ip_static):
+            self._generate_primary_mac()
         domain_fmt = "\n".join([
             '<domain type="kvm">',
             '  <name>{0}</name>',
@@ -141,6 +197,7 @@ class LibvirtdState(MachineState):
             defn.extra_domain,
             '</domain>',
         ])
+        self.log("after domain format")
 
         return domain_fmt.format(
             self._vm_id(),
@@ -150,23 +207,92 @@ class LibvirtdState(MachineState):
             defn.vcpu
         )
 
+    # def updateDHCPHostIPs(self, domainId, net):
+    #     # self._logged_exec(
+    #     #     ["virsh", "-c", "qemu:///system",
+    #     #      "net-update", net[0], "add",
+    #     #      "ip-dhcp-host",
+    #     #      "<host mac='{0} ' name='{1}' ip='{2}' />".format(
+    #     #          net[1], self.name, self.private_ipv4_setting),
+    #     #      "--live", "--config"
+    #     #      ])
+    #     self.log("what is the comainId?")
+    #     self.log(str(domainId))
+    #     self._logged_exec(
+    #         ["virsh", "-c", "qemu:///system",
+    #          "detach-interface", domainId, "network", "--live"
+    #          ])
+    #     self.log("after detach interface")
+    #     self._logged_exec(
+    #         ["virsh", "-c", "qemu:///system",
+    #          "attach-interface", domainId, "network",
+    #          "".join([
+    #              '    <interface type="network">',
+    #              '      <source network="{0}"/>',
+    #              '      <mac address="{1}"/>',
+    #              '      <ip address="{2}" prefix="24"/>',
+    #              '    </interface>'
+    #          ]).format(net[0], net[1], self.private_ipv4_setting),
+    #          "--live"
+    #          ])
+        # self._logged_exec(
+        #     ["virsh", "-c", "qemu:///system",
+        #      "net-start", net[0]])
+        # self._logged_exec(
+        #     ["virsh", "-c", "qemu:///system",
+        #      "net-destroy", net[0]])
+        # self._logged_exec(
+        #     ["virsh", "-c", "qemu:///system",
+        #      "net-start", net[0]])
+
     def _fetch_ip(self):
         if re.match("^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", self.private_ipv4_setting):
+            # self.log_start("Dump xml to get generated mac addresses, to assign static ip to single address to...")
+            # xml = subprocess.check_output(["virsh", "-c", "qemu:///system", "dumpxml", self.vm_id])
+            # tree = ElementTree.fromstring(xml)
+            # interfaces = tree.findall("devices/interface[@type='network']")
+            # # uuidAndName = tree.find("name")
+            # # name = uuidAndName
+            # nets = [(x.find("source").get("network"), x.find("mac").get("address")) for x in interfaces]
+            # if len(nets) == 0:
+            #     raise Exception('VM has no networks configured; aborting')
+            # domainId = tree.find("domain").get("id")
+            # self.log_start("logging tree.attrib[id]")
+            # self.log_start(tree.attrib["id"])
+            # map(partial(self.updateDHCPHostIPs, tree.attrib["id"]), nets)
             return self.private_ipv4_setting
+            # while True:
+            #     lines = subprocess.check_output(["arp", "-an"]).split("\n")
+            #     for line in lines:
+            #         r = re.match('[^()]+ \(([0-9.]+)\) at ([0-9a-f:]+) ', line)
+            #         if not r: continue
+            #         for net in nets:
+            #             if r.group(2) == net[1]:
+            #                ip = r.group(1)
+            #                self.log_end("dynamic ip: " + ip)
+            #                map(lambda net:
+            #                    self._logged_exec(
+            #                        ["virsh", "-c", "qemu:///system",
+            #                         "net-update", net[0], "add",
+            #                         "ip-dhcp-host",
+            #                         "<host mac='{0}' name='{1}' ip='{2}' />".format(
+            #                             net[1], self.name, self.private_ipv4_setting),
+            #                         "--live", "--config"
+            #                         ]),
+            #                    nets
+            #                    )
+            #                self.log_end("static ip: " + ip)
+            #                return self.private_ipv4_setting
 
         elif self.private_ipv4_setting == "arp":
             # Inspired from https://rwmj.wordpress.com/2010/10/26/tip-find-the-ip-address-of-a-virtual-machine/
             xml = subprocess.check_output(["virsh", "-c", "qemu:///system", "dumpxml", self.vm_id])
-            tree = ElementTree.fromstring(xml)
+            tree = ElementTree.fomstring(xml)
             interfaces = tree.findall("devices/interface[@type='network']")
-            # macs = [x.get("address") for x in tree.findall("devices/interface/mac")]
-            # if len(macs) == 0:
-            #     raise Exception('VM has no interface configured; aborting')
-            nets = [(x.find("source").get("network"), x.find("mac").get("address")) for x in interfaces]
-            if len(nets) == 0:
-                raise Exception('VM has no networks configured; aborting')
-            # self.log("Found MAC addresses " + repr(macs))
-            self.log("Found MAC addresses " + repr(nets))
+            macs = [x.get("address") for x in tree.findall("devices/interface/mac")]
+            if len(macs) == 0:
+                raise Exception('VM has no interface configured; aborting')
+            self.log("Found MAC addresses " + repr(macs))
 
             self.log_start("Waiting for IP address to appear in the ARP table...")
             while True:
@@ -174,35 +300,11 @@ class LibvirtdState(MachineState):
                 for line in lines:
                     r = re.match('[^()]+ \(([0-9.]+)\) at ([0-9a-f:]+) ', line)
                     if not r: continue
-                    for net in nets:
-                        if r.group(2) == net[1]:
+                    for mac in macs:
+                        if r.group(2) == mac:
                            ip = r.group(1)
                            self.log_end(" " + ip)
-                           self._logged_exec(
-                               ["virsh", "-c", "qemu:///system",
-                                "net-update", net[0], "add",
-                                "ip-dhcp-host",
-                                "<host mac='{0}' name='{1}' ip='{2}' />".format(
-                                  net[1], self.name, ip),
-                                "--live", "--config"
-                                ]),
                            return ip
-                    # for mac in macs:
-                    #     if r.group(2) == mac:
-                    #        ip = r.group(1)
-                    #        self.log_end(" " + ip)
-                    #        map(lambda network:
-                    #            self.logged_exec(
-                    #                ["virsh", "-c", "qemu:///system",
-                    #                 "net-update", network, "add",
-                    #                 "ip-dhcp-host",
-                    #                 "<host mac='{0}' name='{1}' ip='{2}' />".format(
-                    #                   mac, self.name, ip),
-                    #                 "--live", "--config"
-                    #                 ]),
-                    #            nets
-                    #            )
-                    #        return ip
 
                 self.log_continue(".")
                 time.sleep(1)
@@ -229,14 +331,6 @@ class LibvirtdState(MachineState):
                     else:
                         ip_with_subnet = lines[i + 2]
                         ip = ip_with_subnet.split('/')[0]
-                        self._logged_exec(
-                            ["virsh", "-c", "qemu:///system",
-                             "net-update", net, "add",
-                             "ip-dhcp-host",
-                             "<host mac='{0}' name='{1}' ip='{2}' />".format(
-                                 mac, self.name, ip),
-                             "--live", "--config"
-                             ])
                         self.log_end(" " + ip)
                         return ip
 
@@ -270,21 +364,21 @@ class LibvirtdState(MachineState):
         assert self.vm_id
         if self._is_running():
             self.log_start("shutting down... ")
-            xml = subprocess.check_output(["virsh", "-c", "qemu:///system", "dumpxml", self.vm_id])
-            tree = ElementTree.fromstring(xml)
-            interfaces = tree.findall("devices/interface[@type='network']")
-            nets = [(x.find("source").get("network"), x.find("mac").get("address")) for x in interfaces]
-            map(lambda (net, mac):
-                self._logged_exec(
-                    ["virsh", "-c", "qemu:///system",
-                     "net-update", net, "delete",
-                     "ip-dhcp-host",
-                     "<host mac='{0}' name='{1}' ip='{2}' />".format(
-                         mac, self.name, self.private_ipv4),
-                     "--live", "--config"
-                     ]),
-                nets
-                )
+            # xml = subprocess.check_output(["virsh", "-c", "qemu:///system", "dumpxml", self.vm_id])
+            # tree = ElementTree.fromstring(xml)
+            # interfaces = tree.findall("devices/interface[@type='network']")
+            # nets = [(x.find("source").get("network"), x.find("mac").get("address")) for x in interfaces]
+            # map(lambda (net, mac):
+            #     self._logged_exec(
+            #         ["virsh", "-c", "qemu:///system",
+            #          "net-update", net, "delete",
+            #          "ip-dhcp-host",
+            #          "<host mac='{0}' name='{1}' ip='{2}' />".format(
+            #              mac, self.name, self.private_ipv4),
+            #          "--live", "--config"
+            #          ]),
+            #     nets
+            #     )
             self._logged_exec(["virsh", "-c", "qemu:///system", "destroy", self.vm_id])
         else:
             self.log("not running")

@@ -106,6 +106,14 @@ in
       '';
     };
 
+    deployment.libvirtd.isIPStatic = mkOption {
+      default = false;
+      description = ''
+        if true you must provide a constant privateIPv4 address to assign
+        if false uses relies on system to dynamically generate the ip address
+      '';
+    };
+
     deployment.libvirtd.extraDevicesXML = mkOption {
       default = "";
       type = types.str;
